@@ -1,0 +1,259 @@
+<?php
+
+namespace App\Services;
+
+use Web3\Web3;
+use Web3\Providers\HttpProvider;
+use Web3\RequestManagers\HttpRequestManager;
+use App\Models\Logger;
+use Exception;
+use Illuminate\Support\Facades\Log;
+
+class LogStreamService
+{
+    private $web3;
+    private $blockByTimestamp;
+    private $balanceUtil;
+
+    public function __construct(BlockByTimestamp $blockByTimestamp, BalanceUtil $balanceUtil)
+    {
+        $this->blockByTimestamp = $blockByTimestamp;
+        $this->balanceUtil = $balanceUtil;
+
+        // Initialize Web3 with the Ethereum provider URL
+        $provider = new HttpProvider(new HttpRequestManager(config('services.ethereum.provider'), 10000)); // 10-second timeout
+        $this->web3 = new Web3($provider);
+    }
+
+    /**
+     * Process logs for a given token address.
+     *
+     * @param string $tokenAddress The token contract address.
+     * @throws Exception If an error occurs during log processing.
+     */
+    public function processLogs(string $tokenAddress)
+    {
+        // Get the latest timestamp and block number from the logger
+        $currentTimestamp = Logger::latest('timestamp')->value('timestamp') ?? 1709785187;
+        $currentBlock = Logger::latest('timestamp')->value('block_number');
+
+        while (true) {
+            try {
+                // Fetch the block number for the current timestamp
+                $fromBlock = $this->blockByTimestamp->getBlockByTimestamp($currentTimestamp);
+                $nextTimestamp = $currentTimestamp + (25 * 24 * 60 * 60); // 25 days in seconds
+
+                // Determine the "toBlock" value
+                $toBlock = ($nextTimestamp > time())
+                    ? 'latest'
+                    : $this->blockByTimestamp->getBlockByTimestamp($nextTimestamp);
+
+                // Fetch logs for the token address
+                $logs = $this->fetchLogs($tokenAddress, $fromBlock, $toBlock);
+
+                // Process logs and update balances
+                $balances = $this->processLogsData($logs);
+                $this->balanceUtil->saveBalancesToDatabase($balances);
+
+                // Log the current timestamp and block number
+                Logger::create([
+                    'timestamp' => $currentTimestamp,
+                    'block_number' => $fromBlock,
+                ]);
+
+                // Update the current timestamp
+                $currentTimestamp = $nextTimestamp;
+
+                // Exit the loop if we've reached the latest block
+                if ($toBlock === 'latest') {
+                    break;
+                }
+            } catch (Exception $e) {
+                Log::error('Error processing logs: ' . $e->getMessage());
+                throw $e;
+            }
+        }
+    }
+
+
+    private function fetchLogs(string $tokenAddress, int $fromBlock, $toBlock): array
+    {
+        $logs = [];
+        $retries = 3;
+        $attempt = 0;
+
+        while ($attempt < $retries) {
+            try {
+                // Create a flag to track if the callback has been executed
+                $callbackExecuted = false;
+
+                $this->web3->eth->getLogs([
+                    'address' => $tokenAddress,
+                    'fromBlock' => $fromBlock,
+                    'toBlock' => $toBlock,
+                ], function ($err, $response) use (&$logs, &$callbackExecuted) {
+                    if ($err !== null) {
+                        throw new Exception('Error fetching logs: ' . $err->getMessage());
+                    }
+                    $logs = $response;
+                    $callbackExecuted = true; // Mark the callback as executed
+                });
+
+                // Wait for the callback to execute
+                $startTime = time();
+                while (!$callbackExecuted && (time() - $startTime) < 10) { // Wait up to 10 seconds
+                    usleep(100000); // Sleep for 100ms
+                }
+
+                if (!$callbackExecuted) {
+                    throw new Exception('Timeout while waiting for logs.');
+                }
+
+                return $logs; // Return logs if successful
+            } catch (Exception $e) {
+                $attempt++;
+                Log::warning("Attempt $attempt failed: " . $e->getMessage());
+                sleep(1); // Wait 1 second before retrying
+            }
+        }
+
+        throw new Exception('Failed to fetch logs after ' . $retries . ' attempts.');
+    }
+
+
+    private function processLogsData(array $logs): array
+    {
+        $balances = [];
+        $contractABIPath = storage_path('app/abi/contractABI.json');
+
+        // Ensure ABI file exists
+        if (!file_exists($contractABIPath)) {
+            Log::error('ABI file not found at: ' . $contractABIPath);
+            throw new Exception('ABI file is missing.');
+        }
+
+        $contractABI = json_decode(file_get_contents($contractABIPath), true);
+
+        // Validate ABI file content
+        if (!is_array($contractABI)) {
+            Log::error('Invalid ABI file format. Expected a JSON array.');
+            throw new Exception('Invalid ABI file. Expected a JSON array.');
+        }
+
+        foreach ($logs as $log) {
+            try {
+                // Convert stdClass to array if necessary
+                $logArray = is_object($log) ? (array) $log : $log;
+
+                // Decode log manually
+                $decodedLog = $this->decodeLogManually($logArray, $contractABI);
+
+                if (!isset($decodedLog['event'], $decodedLog['data'])) {
+                    Log::warning('Invalid decoded log structure:', $decodedLog);
+                    continue;
+                }
+
+                $event = $decodedLog['event'];
+                $data = $decodedLog['data'];
+
+                if ($event === 'Transfer') {
+                    $from = $data['from'] ?? null;
+                    $to = $data['to'] ?? null;
+                    $amount = $this->formatAmount($data['value'] ?? '0');
+
+                    if (!$from || !$to) {
+                        Log::warning('Transfer event missing "from" or "to" address:', $data);
+                        continue;
+                    }
+
+                    // Update balances for "from" and "to" addresses
+                    if ($from !== '0x0000000000000000000000000000000000000000') {
+                        $balances[$from] = bcsub($balances[$from] ?? '0', $amount, 0);
+                    }
+                    $balances[$to] = bcadd($balances[$to] ?? '0', $amount, 0);
+                } elseif ($event === 'Mint') {
+                    $to = $data['to'] ?? null;
+                    $amount = $this->formatAmount($data['value'] ?? '0');
+
+                    if (!$to) {
+                        Log::warning('Mint event missing "to" address:', $data);
+                        continue;
+                    }
+
+                    $balances[$to] = bcadd($balances[$to] ?? '0', $amount, 0);
+                }
+            } catch (Exception $e) {
+                Log::error('Error decoding log: ' . $e->getMessage());
+            }
+        }
+
+        return $balances;
+    }
+
+
+
+    /**
+     * Format the amount to a valid numeric string.
+     *
+     * @param mixed $amount The amount to format.
+     * @return string The formatted amount.
+     */
+    private function formatAmount($amount): string
+    {
+        // If the amount is a hexadecimal string (e.g., "0x123"), convert it to decimal
+        if (is_string($amount) && strpos($amount, '0x') === 0) {
+            return hexdec($amount);
+        }
+
+        // If the amount is not a valid numeric string, default to '0'
+        if (!is_numeric($amount)) {
+            return '0';
+        }
+
+        return (string) $amount;
+    }
+
+    /**
+     * Manually decode a log using the ABI.
+     *
+     * @param array $log The log to decode.
+     * @param array $contractABI The contract ABI.
+     * @return array The decoded log.
+     * @throws Exception If the log cannot be decoded.
+     */
+    private function decodeLogManually(array $log, array $contractABI): array
+    {
+        // Find the event definition in the ABI
+        foreach ($contractABI as $item) {
+            if ($item['type'] === 'event' && $item['name'] === 'Transfer') {
+                // Decode the log manually
+                $from = '0x' . substr($log['topics'][1], 26); // Extract "from" address
+                $to = '0x' . substr($log['topics'][2], 26); // Extract "to" address
+                $amount = hexdec(substr($log['data'], 2)); // Extract amount from data
+
+                return [
+                    'event' => 'Transfer',
+                    'data' => [
+                        'from' => $from,
+                        'to' => $to,
+                        'value' => $amount,
+                    ],
+                ];
+            } elseif ($item['type'] === 'event' && $item['name'] === 'Mint') {
+                // Decode the log manually
+                $to = '0x' . substr($log['topics'][1], 26); // Extract "to" address
+                $amount = hexdec(substr($log['data'], 2)); // Extract amount from data
+
+                return [
+                    'event' => 'Mint',
+                    'data' => [
+                        'to' => $to,
+                        'value' => $amount,
+                    ],
+                ];
+            }
+        }
+
+        throw new Exception('Unable to decode log. Event not found in ABI.');
+    }
+}

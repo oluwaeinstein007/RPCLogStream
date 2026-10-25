@@ -6,7 +6,7 @@
     "keywords": ["laravel", "framework"],
     "license": "MIT",
     "require": {
-        "php": "^8.3",
+        "php": "~8.3.36 || ~8.4.27 || ^8.5.12",
         "guzzlehttp/guzzle": "^7.9",
         "laravel/framework": "^13.0",
         "laravel/tinker": "^3.0",
@@ -60,6 +60,11 @@
         }
     },
     "config": {
+        "audit": {
+            "ignore": {
+                "CVE-2026-84308": "Not reachable: the vulnerable X25519 code (phpseclib 3 Crypt/EC, Math/PrimeField) does not exist in phpseclib 2.0.x; web3p/web3.php only uses phpseclib\\Math\\BigInteger, and phpseclib 2 SSH2 delegates curve25519 to libsodium."
+            }
+        },
         "optimize-autoloader": true,
         "preferred-install": "dist",
         "sort-packages": true,
